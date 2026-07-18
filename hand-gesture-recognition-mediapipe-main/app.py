@@ -15,6 +15,41 @@ from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
 
+WINDOW_NAME = 'Hand Gesture Recognition'
+
+# ---- Gesture menu layout (used by both drawing and click-hit-testing) ----
+MENU_X = 10
+MENU_Y_START = 150
+MENU_HEADER_HEIGHT = 32
+MENU_WIDTH = 260
+ITEM_HEIGHT = 24
+ITEMS_PER_PAGE = 10
+ARROW_BTN_SIZE = 28
+
+
+class MenuState:
+    """Shared, mutable state passed into the OpenCV mouse callback.
+
+    OpenCV's mouse callback only fires with (event, x, y, flags, param),
+    so we bundle everything the callback needs to read/write into one
+    object and pass it in as `param`.
+    """
+
+    def __init__(self, labels):
+        self.labels = labels
+        self.mode = 0
+        self.clicked_index = -1
+        self.log_feedback_label = ""
+        self.log_feedback_frames = 0
+        self.page = 0
+        self.total_pages = max(1, -(-len(labels) // ITEMS_PER_PAGE))  # ceil div
+
+    def next_page(self):
+        self.page = min(self.total_pages - 1, self.page + 1)
+
+    def prev_page(self):
+        self.page = max(0, self.page - 1)
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -36,6 +71,42 @@ def get_args():
     args = parser.parse_args()
 
     return args
+
+
+def mouse_callback(event, x, y, flags, state):
+    """Handles clicks on the gesture menu: the < and > page buttons, and
+    the up-to-10 gesture rows on the current page.
+
+    Only reacts while in "Logging Key Point" mode (mode == 1), which is
+    when the menu is actually drawn on screen.
+    """
+    if state.mode != 1 or event != cv.EVENT_LBUTTONDOWN:
+        return
+
+    header_y = MENU_Y_START - MENU_HEADER_HEIGHT
+
+    # "<" button (previous page), left of the header
+    prev_rect = (MENU_X, header_y + 2, MENU_X + ARROW_BTN_SIZE, header_y + 2 + ARROW_BTN_SIZE)
+    if prev_rect[0] <= x <= prev_rect[2] and prev_rect[1] <= y <= prev_rect[3]:
+        state.prev_page()
+        return
+
+    # ">" button (next page), right of the header
+    next_x0 = MENU_X + MENU_WIDTH - ARROW_BTN_SIZE
+    next_rect = (next_x0, header_y + 2, next_x0 + ARROW_BTN_SIZE, header_y + 2 + ARROW_BTN_SIZE)
+    if next_rect[0] <= x <= next_rect[2] and next_rect[1] <= y <= next_rect[3]:
+        state.next_page()
+        return
+
+    # One of the up-to-10 gesture rows on the current page
+    if x < MENU_X or x > MENU_X + MENU_WIDTH or y < MENU_Y_START:
+        return
+    row = (y - MENU_Y_START) // ITEM_HEIGHT
+    if row >= ITEMS_PER_PAGE:
+        return
+    idx = state.page * ITEMS_PER_PAGE + row
+    if 0 <= idx < len(state.labels):
+        state.clicked_index = idx
 
 
 def main():
@@ -92,11 +163,16 @@ def main():
     history_length = 16
     point_history = deque(maxlen=history_length)
 
-    # Finger gesture history ################################################
+    # Finger gesture history 
     finger_gesture_history = deque(maxlen=history_length)
 
-    #  ########################################################################
+    #  Mode selection 
     mode = 0
+
+    # Gesture menu setup ###################################################
+    menu_state = MenuState(keypoint_classifier_labels)
+    cv.namedWindow(WINDOW_NAME)
+    cv.setMouseCallback(WINDOW_NAME, mouse_callback, menu_state)
 
     while True:
         fps = cvFpsCalc.get()
@@ -105,7 +181,21 @@ def main():
         key = cv.waitKey(10)
         if key == 27:  # ESC
             break
+        if key == ord('['):  # previous menu page
+            menu_state.prev_page()
+        if key == ord(']'):  # next menu page
+            menu_state.next_page()
         number, mode = select_mode(key, mode)
+
+        # A menu click behaves like a single numpad press: it supplies the
+        # gesture "number" for this one frame, then is consumed.
+        if menu_state.clicked_index != -1:
+            number = menu_state.clicked_index
+            menu_state.clicked_index = -1
+
+        # Keep the callback aware of the current mode so it only reacts
+        # while the menu is actually visible.
+        menu_state.mode = mode
 
         # Camera capture #####################################################
         ret, image = cap.read()
@@ -136,8 +226,12 @@ def main():
                 pre_processed_point_history_list = pre_process_point_history(
                     debug_image, point_history)
                 # Write to the dataset file
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+                logged = logging_csv(number, mode, pre_processed_landmark_list,
+                                     pre_processed_point_history_list,
+                                     keypoint_classifier_labels)
+                if logged and mode == 1 and 0 <= number < len(keypoint_classifier_labels):
+                    menu_state.log_feedback_label = keypoint_classifier_labels[number]
+                    menu_state.log_feedback_frames = 20
 
                 # Hand sign classification
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
@@ -174,8 +268,16 @@ def main():
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
 
+        # Gesture menu overlay (only while in "Logging Key Point" mode) ####
+        if mode == 1:
+            debug_image = draw_gesture_menu(debug_image, menu_state)
+
+        if menu_state.log_feedback_frames > 0:
+            debug_image = draw_log_feedback(debug_image, menu_state.log_feedback_label)
+            menu_state.log_feedback_frames -= 1
+
         # Screen reflection #############################################################
-        cv.imshow('Hand Gesture Recognition', debug_image)
+        cv.imshow(WINDOW_NAME, debug_image)
 
     cap.release()
     cv.destroyAllWindows()
@@ -183,7 +285,7 @@ def main():
 
 def select_mode(key, mode):
     number = -1
-    if 48 <= key <= 57:  # 0 ~ 9
+    if 48 <= key <= 57:  # 0 ~ 9  (still works as a shortcut alongside the menu)
         number = key - 48
     if key == 110:  # n
         mode = 0
@@ -278,20 +380,90 @@ def pre_process_point_history(image, point_history):
     return temp_point_history
 
 
-def logging_csv(number, mode, landmark_list, point_history_list):
+def logging_csv(number, mode, landmark_list, point_history_list, keypoint_labels):
+    """Returns True if a row was actually written for the keypoint classifier."""
     if mode == 0:
-        pass
-    if mode == 1 and (0 <= number <= 9):
+        return False
+    if mode == 1 and (0 <= number < len(keypoint_labels)):
         csv_path = 'model/keypoint_classifier/keypoint.csv'
         with open(csv_path, 'a', newline="") as f:
             writer = csv.writer(f)
             writer.writerow([number, *landmark_list])
+        return True
     if mode == 2 and (0 <= number <= 9):
         csv_path = 'model/point_history_classifier/point_history.csv'
         with open(csv_path, 'a', newline="") as f:
             writer = csv.writer(f)
             writer.writerow([number, *point_history_list])
-    return
+    return False
+
+
+def draw_gesture_menu(image, state):
+    """Draws a clickable list of up to 10 gesture labels at a time (from the
+    keypoint classifier label CSV), with < and > buttons to move between
+    pages. Clicking a row logs one entry for that gesture, the same way
+    pressing a numpad key used to."""
+    labels = state.labels
+    header_y = MENU_Y_START - MENU_HEADER_HEIGHT
+    box_height = MENU_HEADER_HEIGHT + ITEMS_PER_PAGE * ITEM_HEIGHT
+
+    overlay = image.copy()
+    cv.rectangle(overlay, (MENU_X - 6, header_y - 4),
+                 (MENU_X + MENU_WIDTH + 6, header_y + box_height),
+                 (40, 40, 40), -1)
+    image = cv.addWeighted(overlay, 0.7, image, 0.3, 0)
+
+    # "<" button
+    prev_enabled = state.page > 0
+    prev_color = (255, 255, 0) if prev_enabled else (110, 110, 110)
+    cv.rectangle(image, (MENU_X, header_y + 2),
+                 (MENU_X + ARROW_BTN_SIZE, header_y + 2 + ARROW_BTN_SIZE),
+                 prev_color, 1)
+    cv.putText(image, "<", (MENU_X + 9, header_y + 22),
+               cv.FONT_HERSHEY_SIMPLEX, 0.6, prev_color, 2, cv.LINE_AA)
+
+    # ">" button
+    next_enabled = state.page < state.total_pages - 1
+    next_color = (255, 255, 0) if next_enabled else (110, 110, 110)
+    next_x0 = MENU_X + MENU_WIDTH - ARROW_BTN_SIZE
+    cv.rectangle(image, (next_x0, header_y + 2),
+                 (next_x0 + ARROW_BTN_SIZE, header_y + 2 + ARROW_BTN_SIZE),
+                 next_color, 1)
+    cv.putText(image, ">", (next_x0 + 8, header_y + 22),
+               cv.FONT_HERSHEY_SIMPLEX, 0.6, next_color, 2, cv.LINE_AA)
+
+    # Page indicator, centered between the two buttons
+    header_text = f"Page {state.page + 1}/{state.total_pages}"
+    text_size = cv.getTextSize(header_text, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+    text_x = MENU_X + (MENU_WIDTH - text_size[0]) // 2
+    cv.putText(image, header_text, (text_x, header_y + 20),
+               cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+
+    # Up to 10 gesture rows for the current page
+    start_idx = state.page * ITEMS_PER_PAGE
+    for row in range(ITEMS_PER_PAGE):
+        idx = start_idx + row
+        if idx >= len(labels):
+            break
+        item_y = MENU_Y_START + row * ITEM_HEIGHT
+        cv.rectangle(image, (MENU_X, item_y), (MENU_X + MENU_WIDTH, item_y + ITEM_HEIGHT - 2),
+                     (90, 90, 90), -1)
+        cv.rectangle(image, (MENU_X, item_y), (MENU_X + MENU_WIDTH, item_y + ITEM_HEIGHT - 2),
+                     (220, 220, 220), 1)
+        display_label = labels[idx] if labels[idx] else f"(label {idx})"
+        cv.putText(image, f"{idx}: {display_label}", (MENU_X + 6, item_y + 17),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+
+    return image
+
+
+def draw_log_feedback(image, label):
+    text = f"Logged: {label}"
+    cv.putText(image, text, (10, 130), cv.FONT_HERSHEY_SIMPLEX, 0.7,
+               (0, 0, 0), 3, cv.LINE_AA)
+    cv.putText(image, text, (10, 130), cv.FONT_HERSHEY_SIMPLEX, 0.7,
+               (0, 255, 0), 1, cv.LINE_AA)
+    return image
 
 
 def draw_landmarks(image, landmark_point):
@@ -394,87 +566,11 @@ def draw_landmarks(image, landmark_point):
 
     # Key Points
     for index, landmark in enumerate(landmark_point):
-        if index == 0:  # 手首1
+        if index in (0, 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19):
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 1:  # 手首2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 2:  # 親指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 3:  # 親指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 4:  # 親指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 5:  # 人差指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 6:  # 人差指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 7:  # 人差指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 8:  # 人差指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 9:  # 中指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 10:  # 中指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 11:  # 中指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 12:  # 中指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 13:  # 薬指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 14:  # 薬指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 15:  # 薬指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 16:  # 薬指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 17:  # 小指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 18:  # 小指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 19:  # 小指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 20:  # 小指：指先
+        if index in (4, 8, 12, 16, 20):
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
