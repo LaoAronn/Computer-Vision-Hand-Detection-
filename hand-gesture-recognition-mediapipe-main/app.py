@@ -110,7 +110,7 @@ def mouse_callback(event, x, y, flags, state):
 
 
 def main():
-    # Argument parsing #################################################################
+    # Argument parsing  ####
     args = get_args()
 
     cap_device = args.device
@@ -123,12 +123,12 @@ def main():
 
     use_brect = True
 
-    # Camera preparation ###############################################################
+    # Camera preparation  ##
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    # Model load #############################################################
+    # Model load  
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
@@ -159,7 +159,7 @@ def main():
     # FPS Measurement ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # Coordinate history #################################################################
+    # Coordinate history  ####
     history_length = 16
     point_history = deque(maxlen=history_length)
 
@@ -197,21 +197,21 @@ def main():
         # while the menu is actually visible.
         menu_state.mode = mode
 
-        # Camera capture #####################################################
+        # Camera capture
         ret, image = cap.read()
         if not ret:
             break
         image = cv.flip(image, 1)  # Mirror display
         debug_image = copy.deepcopy(image)
 
-        # Detection implementation #############################################################
+        # Detection implementation  
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         image.flags.writeable = False
         results = hands.process(image)
         image.flags.writeable = True
 
-        #  ####################################################################
+        #  Detection result
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
                                                   results.multi_handedness):
@@ -276,7 +276,7 @@ def main():
             debug_image = draw_log_feedback(debug_image, menu_state.log_feedback_label)
             menu_state.log_feedback_frames -= 1
 
-        # Screen reflection #############################################################
+        # Screen reflection  
         cv.imshow(WINDOW_NAME, debug_image)
 
     cap.release()
